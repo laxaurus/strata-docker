@@ -1,0 +1,35 @@
+# Strata on AMD ROCm. The image compiles the gfx1100 engine at build time; the
+# container runs docker-entrypoint.sh, which sets the model up once (using the
+# GGUF files you mount in ./data) and then serves. `docker logs -f strata`
+# shows the server output.
+#
+# Change the model/context/vision with the env vars below (or a .env file).
+
+services:
+  strata:
+    build: .
+    image: strata-rocm:7.2.4
+    container_name: strata
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+    security_opt:
+      - seccomp=unconfined
+    ipc: host            # Strata pins large amounts of RAM; avoid shm limits
+    ports:
+      - 8088:8080
+    volumes:
+      - ./data:/data     # model shards + pack + MTP + config live here
+    environment:
+      FAMILY: qwen
+      MODEL: Q2_0
+      CONTEXT: 131072
+      VISION: "no"
+      KV: int8
+      HOST: 0.0.0.0
+      PORT: 8080
+      LOW_RAM: auto
+      GGUF_DIR: /data/Q2_0
+      # API_KEY: put-a-secret-here   # set before exposing the port to a network

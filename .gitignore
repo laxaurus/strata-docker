@@ -1,0 +1,9 @@
+# Model files and generated artifacts - do not commit
+data/
+*.gguf
+.env
+
+# Python / build leftovers
+__pycache__/
+*.pyc
+build-hip/
