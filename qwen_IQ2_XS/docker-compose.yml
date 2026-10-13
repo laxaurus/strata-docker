@@ -1,0 +1,41 @@
+# Strata on AMD ROCm. The image compiles the gfx1100 engine at build time; the
+# container runs docker-entrypoint.sh, which sets the model up once (using the
+# GGUF files you mount in ./data) and then serves. `docker logs -f strata`
+# shows the server output.
+#
+# Change the model/context/vision with the env vars below (or a .env file).
+#
+# IQ2_XS shards (~70 GB total) live in ./data/IQ2_XS. Fetch them once with:
+#   hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF \
+#     --include "IQ2_XS/*" --local-dir ./data
+
+services:
+  strata:
+    build:
+      context: .
+      dockerfile: dockerfile
+    image: strata-rocm:7.2.4
+    container_name: strata-qwen-IQ2_XS
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+    security_opt:
+      - seccomp=unconfined
+    ipc: host            # Strata pins large amounts of RAM; avoid shm limits
+    ports:
+      - 8089:8080    # 8088 is taken by the Q2_0 compose; change if you run only one
+    volumes:
+      - ./data:/data     # model shards + pack + MTP + config live here
+    environment:
+      FAMILY: qwen
+      MODEL: IQ2_XS
+      CONTEXT: 131072
+      VISION: "no"
+      KV: int8              # IQ2_XS needs ~39 GB, fits like the Q2_0 setup did
+      HOST: 0.0.0.0
+      PORT: 8080
+      LOW_RAM: auto
+      GGUF_DIR: /data/IQ2_XS
+      # API_KEY: put-a-secret-here   # set before exposing the port to a network

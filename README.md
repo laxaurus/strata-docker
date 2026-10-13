@@ -8,6 +8,21 @@ so the model sets itself up once and then serves — with all output visible in
 
 ---
 
+## Repository layout
+
+One setup per quant, each with its own `dockerfile` + `docker-compose.yml`:
+
+| Folder | Model / quant | Host port | Notes |
+|--------|---------------|-----------|-------|
+| `qwen_Q2_0/` | Q2_0 (~62 GB shards) | 8088 | Original setup |
+| `qwen_IQ2_XS/` | IQ2_XS (~64 GB shards) | 8089 | GSQ-RCO quant, `strata-qwen-IQ2_XS` container |
+| `bare/` | *(no model defaults)* | 8080 | Interactive image: you run `./setup.sh` yourself inside the container |
+
+All variants share the same image build (ROCm 7.2.4 + precompiled gfx1100 engine);
+they differ only in the default `MODEL` / `GGUF_DIR` and the compose wiring.
+
+---
+
 ## How it works
 
 | Stage | What happens | GPU needed? |
@@ -25,7 +40,14 @@ The model itself is **not** baked into the image — mount your GGUF files into 
 - **Host:** an AMD GPU with the `amdgpu` kernel driver (any recent Ubuntu ships it).
   You do **not** need ROCm installed on the host — only the driver.
 - Docker (with `docker compose` v2).
-- Model GGUF files in `./data` (e.g. `./data/Q2_0/*.gguf` plus the vision projector).
+- Model GGUF files in the folder's `./data` (e.g. `./data/Q2_0/*.gguf` plus the
+  vision projector). Fetch a quant once with `hf download`, e.g.:
+
+  ```bash
+  # IQ2_XS (~70 GB total)
+  hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF \
+    --include "IQ2_XS/*" --local-dir ./data
+  ```
 
 Check the driver is present:
 
@@ -37,20 +59,25 @@ ls /dev/kfd /dev/dri
 
 ## Quick start (docker compose)
 
+Pick the quant you want, `cd` into its folder, and bring it up:
+
 ```bash
+cd qwen_Q2_0          # or qwen_IQ2_XS
 docker compose up -d
-docker logs -f strata
+docker logs -f strata # or docker logs -f strata-qwen-IQ2_XS
 ```
 
-The server is reachable at `http://localhost:8088` (OpenAI-compatible API at
-`http://localhost:8088/v1`). The first run takes longer because it builds the pack
-and downloads the MTP layer.
+- Q2_0 serves at `http://localhost:8088` (OpenAI-compatible API at `/v1`).
+- IQ2_XS serves at `http://localhost:8089` so both can run side by side.
+
+The first run takes longer because it builds the pack and downloads the MTP layer.
 
 ---
 
 ## Manual `docker run`
 
 ```bash
+cd qwen_Q2_0   # or qwen_IQ2_XS, or bare for the interactive variant
 docker build -t strata-rocm:7.2.4 .
 
 docker run -d --name strata \
@@ -63,6 +90,9 @@ docker run -d --name strata \
   strata-rocm:7.2.4
 ```
 
+The `bare/` variant has no entrypoint: `docker run -it` it, then
+`./setup.sh --setup` (model download + engine build) and `./setup.sh` to serve.
+
 ---
 
 ## Configuration
@@ -73,14 +103,14 @@ in `docker-compose.yml` (or a `.env` file), or with `-e ...` on `docker run`.
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `FAMILY` | `qwen` | Model family |
-| `MODEL` | `Q2_0` | Model name / quant |
+| `MODEL` | `Q2_0` / `IQ2_XS` | Model name / quant (per folder) |
 | `CONTEXT` | `131072` | Context window (tokens) |
 | `VISION` | `no` | `no`, `yes`, or `cpu` |
 | `KV` | `int8` | KV cache quant: `int8`, `q4_0`, `k8v4` |
 | `HOST` | `0.0.0.0` | Bind address |
 | `PORT` | `8080` | Server port (inside the container) |
 | `LOW_RAM` | `auto` | RAM-saving mode |
-| `GGUF_DIR` | `/data/Q2_0` | Folder containing your GGUF shards |
+| `GGUF_DIR` | `/data/Q2_0` / `/data/IQ2_XS` | Folder containing your GGUF shards |
 | `STRATA_DATA` | `/data` | Where the pack / MTP / config are written |
 | `API_KEY` | *(unset)* | Protect the API; clients send it as their API key |
 | `REINSTALL` | *(unset)* | Set to `1` to redo setup with new settings |
@@ -101,7 +131,8 @@ docker build -t strata-rocm:7.2.4 \
 ## Tuning for RAM
 
 Strata pins a large amount of RAM for the model weights and KV cache. The default
-`Q2_0` at `CONTEXT=131072` needs roughly **38 GB**. To fit on smaller machines:
+`Q2_0` at `CONTEXT=131072` needs roughly **38 GB**; `IQ2_XS` needs roughly **39 GB**.
+To fit on smaller machines:
 
 - **Lower the context:** `-e CONTEXT=8192` (or `16384`, `32768`). Context size is the
   biggest RAM lever.
@@ -116,12 +147,12 @@ container's shared-memory size.
 
 ## Changing the model
 
-Put your GGUF shards in `./data` and point `GGUF_DIR` at the folder:
+Put your GGUF shards in the folder's `./data` and point `GGUF_DIR` at it:
 
 ```yaml
 environment:
-  MODEL: Q2_0
-  GGUF_DIR: /data/Q2_0
+  MODEL: IQ2_XS
+  GGUF_DIR: /data/IQ2_XS
 ```
 
 If you change `MODEL`, `CONTEXT`, `VISION`, or `KV` after the first run, re-run setup
@@ -147,4 +178,5 @@ docker run -d --name strata -e REINSTALL=1 -e CONTEXT=8192 ... strata-rocm:7.2.4
 - The pack/MTP/config are generated on the **first run**, not at build time, because
   that step needs the GPU present for AMD detection. The engine binary, however, is
   compiled at build time.
-- The `data/` directory (model files) is intentionally **not** committed to git.
+- The `data/` directories (model files, packs, MTP layers) are intentionally **not**
+  committed to git.
