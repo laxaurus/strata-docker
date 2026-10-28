@@ -1,0 +1,179 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# Strata (Niko1221/Strata) on AMD ROCm 7.2.4 - RX 7900 XTX (gfx1100)
+#
+# Custom AMD container for Strata, since the official Dockerfile is NVIDIA-only.
+# ROCm 7.2.4 user-space is baked in; the amdgpu kernel driver must be on the
+# HOST (any recent Ubuntu kernel ships it - no host ROCm install needed).
+#
+# What happens at BUILD time (no GPU needed to build):
+#   - ROCm 7.2.4 user-space is installed
+#   - the Strata source is cloned and its Python venv is created
+#   - the HIP engine is COMPILED for gfx1100 and baked into the image
+#     (engine/strata + engine/BUILD.json, exactly what setup.py expects)
+#
+# What happens at RUN time (the GPU is present):
+#   docker-entrypoint.sh runs setup.py ONCE - it builds the pack, fetches the
+#   MTP draft layer and writes the config using the model you mount in /data -
+#   then starts the server. Later starts skip straight to serving. Because the
+#   server is the container's PID 1, `docker logs -f strata` shows its output.
+#
+# Build:
+#   docker build -t strata-rocm:7.2.4 .
+#   docker build -t strata-rocm:7.2.4 --build-arg HIP_ARCH=gfx1100 .
+#
+# Run (host needs the amdgpu driver; model files in ./data mounted at /data):
+#   docker run -d --name strata \
+#     --device=/dev/kfd --device=/dev/dri \
+#     --group-add video --group-add render \
+#     --security-opt seccomp=unconfined --ipc=host \
+#     -p 127.0.0.1:8088:8080 \
+#     -v ./data:/data \
+#     -e MODEL=IQ3_XXS -e CONTEXT=131072 -e VISION=no \
+#     strata-rocm:7.2.4
+#
+# Setup choices are env vars read by docker-entrypoint.sh: FAMILY, MODEL,
+# CONTEXT, VISION (no|yes|cpu), KV (int8|q4_0|k8v4), GPU/GPUS, LOW_RAM, HOST,
+# PORT, API_KEY, GGUF_DIR (GGUF files you already have), REINSTALL=1 to redo
+# the setup with different settings.
+# =============================================================================
+
+FROM ubuntu:24.04
+
+ARG ROCM_VERSION=7.2.4
+ENV DEBIAN_FRONTEND=noninteractive \
+    ROCM_PATH=/opt/rocm \
+    HIP_PATH=/opt/rocm \
+    PATH=/opt/rocm/bin:$PATH \
+    LANG=C.UTF-8 \
+    PYTHONUNBUFFERED=1 \
+    STRATA_EXECV=1
+
+# ---------------------------------------------------------------------------
+# 1. Base tooling (Strata needs git + build-essential to compile the engine)
+# ---------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        wget curl ca-certificates git git-lfs \
+        build-essential cmake ninja-build pkg-config \
+        python3 python3-pip python3-venv python3-dev \
+        gpg kmod libatomic1 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# 2. ROCm 7.2.4 user-space (NO kernel driver inside the container - the host
+#    amdgpu module provides /dev/kfd and /dev/dri)
+#    https://rocm.docs.amd.com - Ubuntu native installation, pinned to 7.2.4
+# ---------------------------------------------------------------------------
+RUN mkdir -p /etc/apt/keyrings \
+    && wget -q https://repo.radeon.com/rocm/rocm.gpg.key -O - \
+       | gpg --dearmor -o /etc/apt/keyrings/rocm.gpg \
+    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${ROCM_VERSION} noble main" \
+       > /etc/apt/sources.list.d/rocm.list \
+    && printf 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n' \
+       > /etc/apt/preferences.d/rocm-pin-600 \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        rocm-hip-sdk \
+        rocminfo \
+        rocm-smi-lib \
+    && rm -rf /var/lib/apt/lists/*
+
+# sanity: print the ROCm version at build time (no GPU needed)
+RUN rocminfo --version 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# 3. Strata source (pinned shallow clone; override with --build-arg STRATA_REF)
+# ---------------------------------------------------------------------------
+ARG STRATA_REF=main
+WORKDIR /opt/strata
+RUN git clone --depth 1 --branch ${STRATA_REF} https://github.com/Niko1221/Strata.git .
+
+# ---------------------------------------------------------------------------
+# 4. Python venv + the packages setup.py/server.py need
+# ---------------------------------------------------------------------------
+RUN python3 -m venv .venv \
+    && .venv/bin/pip install --no-cache-dir --upgrade pip \
+    && .venv/bin/pip install --no-cache-dir -r requirements.txt
+
+# The repo's main branch moved its entrypoint to docker/entrypoint.sh (NVIDIA-only
+# flow); this custom AMD one lives in the build folder so the image keeps it.
+COPY docker-entrypoint.sh ./
+RUN chmod +x setup.sh docker-entrypoint.sh
+
+# ---------------------------------------------------------------------------
+# 5. Compile the HIP engine for gfx1100 at build time (no GPU required to
+#    compile). This writes engine/strata + engine/BUILD.json with the same
+#    "src" hash setup.py computes, so the first container start reuses it
+#    instead of recompiling (10-20 min saved on every fresh container).
+#    Override the target with --build-arg HIP_ARCH=gfx1101 etc.
+# ---------------------------------------------------------------------------
+ARG HIP_ARCH=gfx1100
+RUN HIP_ARCH=${HIP_ARCH} .venv/bin/python - <<'PYEOF'
+import os, json, shutil
+import setup
+
+archs = os.environ.get("HIP_ARCH", "gfx1100").split(",")
+llama = setup.get_llama_cpp()
+root, dirs = setup.rocm_root(archs)
+bitcode = next((p for p in (root / "lib" / "llvm" / "amdgcn" / "bitcode",
+                            root / "amdgcn" / "bitcode") if p.is_dir()),
+               root / "amdgcn" / "bitcode")
+os.environ.update({"HIP_PLATFORM": "amd", "HIP_COMPILER": "clang",
+                   "HIP_RUNTIME": "rocclr", "ROCM_PATH": str(root), "HIP_PATH": str(root)})
+os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(
+    dirs + [os.environ.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
+os.environ["PATH"] = os.pathsep.join(
+    [str(root / "bin"), str(root / "llvm" / "bin"), os.environ.get("PATH", "")])
+
+setup.cmake_build(setup.ROOT, setup.ROOT / "build-hip", "strata",
+    ["-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_BUILD_TESTS=OFF",
+     "-DSTRATA_PREFILL_MMQ=ON",
+     "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(archs),
+     f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}",
+     f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
+     "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *dirs]),
+     f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}",
+     f"-DSTRATA_GGML_DIR={llama}"], None, "")
+
+eng = setup.ROOT / "engine"
+eng.mkdir(exist_ok=True)
+shutil.copy2(setup.ROOT / "build-hip" / setup.EXE, eng / setup.EXE)
+meta = {"source": "local-hip", "backend": "hip", "version": setup.source_version(),
+        "archs": archs, "vision": "none", "lib_dirs": dirs,
+        "src": setup.source_hash(setup.ENGINE_SOURCES)}
+(eng / "BUILD.json").write_text(json.dumps(meta, indent=1))
+print("engine built for", archs, "->", eng / setup.EXE)
+PYEOF
+
+# the cmake tree is build-time only; the engine binary is what the container needs
+RUN rm -rf build-hip
+
+# ---------------------------------------------------------------------------
+# 6. Defaults for the setup options (override with -e ... at run time).
+#    The model itself is NOT baked into the image: mount your GGUF files into
+#    /data and point GGUF_DIR at the folder that holds the shards.
+# ---------------------------------------------------------------------------
+ENV FAMILY=qwen \
+    MODEL=IQ3_XXS \
+    CONTEXT=131072 \
+    VISION=no \
+    KV=int8 \
+    HOST=0.0.0.0 \
+    PORT=8080 \
+    LOW_RAM=auto \
+    STRATA_DATA=/data \
+    GGUF_DIR=/data/IQ3_XXS
+
+# /data holds the model, the prepared pack, the MTP layer and the install config;
+# mount a volume (or your ./data folder) over it so they survive recreation.
+VOLUME ["/data"]
+EXPOSE 8080
+
+# The port only opens after the model loads (1-3 min, longer on the first run),
+# so the start period is generous to avoid marking a still-loading container unhealthy.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \
+    CMD curl -fs "http://127.0.0.1:${PORT:-8080}/health" || exit 1
+
+# Auto-run setup once, then serve. STRATA_EXECV=1 makes the server PID 1 so
+# `docker stop` reaches it cleanly. Output goes to stdout -> `docker logs -f strata`.
+ENTRYPOINT ["./docker-entrypoint.sh"]

@@ -8,6 +8,13 @@
 # IQ2_XS shards (~70 GB total) live in ./data/IQ2_XS. Fetch them once with:
 #   hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF \
 #     --include "IQ2_XS/*" --local-dir ./data
+#
+# Max tokens (issue #545): entrypoint.sh pins "fit_max_tokens": true in the model
+# config and writes {"max_tokens": MAX_TOKENS} to strata-<model>.shared-settings.json
+# (in /data/config and beside the /opt/strata config the server is started with), so
+# coding CLI requests that omit max_tokens get 22000 and oversized ones are shortened
+# to the room left instead of failing with a 400. Clients that send their own
+# max_tokens are not capped - the server only clamps to the room left.
 
 services:
   strata:
@@ -25,17 +32,21 @@ services:
       - seccomp=unconfined
     ipc: host            # Strata pins large amounts of RAM; avoid shm limits
     ports:
-      - 8089:8080    # 8088 is taken by the Q2_0 compose; change if you run only one
+      - 8088:8080
     volumes:
       - ./data:/data     # model shards + pack + MTP + config live here
+      - ./entrypoint.sh:/opt/strata/entrypoint.sh:ro
+    entrypoint: ["sh", "/opt/strata/entrypoint.sh"]
     environment:
       FAMILY: qwen
       MODEL: IQ2_XS
+      MAX_TOKENS: 22000          # shared-settings default + fit_max_tokens clamp (issue #545)
       CONTEXT: 131072
-      VISION: "no"
+      VISION: "none"             # AMD/HIP has no GPU image encoder; CPU encoder (Linux-only)
       KV: int8              # IQ2_XS needs ~39 GB, fits like the Q2_0 setup did
       HOST: 0.0.0.0
       PORT: 8080
       LOW_RAM: auto
       GGUF_DIR: /data/IQ2_XS
+      REINSTALL: 1
       # API_KEY: put-a-secret-here   # set before exposing the port to a network

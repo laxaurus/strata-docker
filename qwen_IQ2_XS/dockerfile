@@ -93,8 +93,12 @@ RUN git clone --depth 1 --branch ${STRATA_REF} https://github.com/Niko1221/Strat
 # ---------------------------------------------------------------------------
 RUN python3 -m venv .venv \
     && .venv/bin/pip install --no-cache-dir --upgrade pip \
-    && .venv/bin/pip install --no-cache-dir -r requirements.txt \
-    && chmod +x setup.sh docker-entrypoint.sh
+    && .venv/bin/pip install --no-cache-dir -r requirements.txt
+
+# The repo's main branch moved its entrypoint to docker/entrypoint.sh (NVIDIA-only
+# flow); this custom AMD one lives in the build folder so the image keeps it.
+COPY docker-entrypoint.sh ./
+RUN chmod +x setup.sh docker-entrypoint.sh
 
 # ---------------------------------------------------------------------------
 # 5. Compile the HIP engine for gfx1100 at build time (no GPU required to

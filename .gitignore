@@ -7,3 +7,7 @@ data/
 __pycache__/
 *.pyc
 build-hip/
+
+# HF download staging and runtime logs
+.cache/
+*.log

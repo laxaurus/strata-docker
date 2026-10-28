@@ -2,8 +2,9 @@
 
 A custom Docker setup for [Strata](https://github.com/Niko1221/Strata) on AMD GPUs.
 The official Strata Dockerfile is NVIDIA-only, so this image builds the **HIP engine
-for gfx1100** and runs Strata's own `docker-entrypoint.sh` as the container's PID 1,
-so the model sets itself up once and then serves — with all output visible in
+for gfx1100**, carries its own AMD `docker-entrypoint.sh` (Strata's `main` moved its
+entrypoint to `docker/entrypoint.sh`), and runs it as the container's PID 1, so the
+model sets itself up once and then serves — with all output visible in
 `docker logs -f strata`.
 
 ---
@@ -15,11 +16,14 @@ One setup per quant, each with its own `dockerfile` + `docker-compose.yml`:
 | Folder | Model / quant | Host port | Notes |
 |--------|---------------|-----------|-------|
 | `qwen_Q2_0/` | Q2_0 (~62 GB shards) | 8088 | Original setup |
-| `qwen_IQ2_XS/` | IQ2_XS (~64 GB shards) | 8089 | GSQ-RCO quant, `strata-qwen-IQ2_XS` container |
+| `qwen_IQ2_XS/` | IQ2_XS (~64 GB shards) | 8088 | GSQ-RCO quant, `strata-qwen-IQ2_XS` container |
+| `qwen_IQ3_XXS/` | IQ3_XXS (~77 GB shards) | 8088 | GSQ-RCO quant, `strata-qwen-IQ3_XXS` container |
 | `bare/` | *(no model defaults)* | 8080 | Interactive image: you run `./setup.sh` yourself inside the container |
 
 All variants share the same image build (ROCm 7.2.4 + precompiled gfx1100 engine);
-they differ only in the default `MODEL` / `GGUF_DIR` and the compose wiring.
+they differ only in the default `MODEL` / `GGUF_DIR` and the compose wiring. The three
+model setups all default to host port **8088**, so run one at a time — or edit
+`ports:` if you want them side by side.
 
 ---
 
@@ -47,6 +51,10 @@ The model itself is **not** baked into the image — mount your GGUF files into 
   # IQ2_XS (~70 GB total)
   hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF \
     --include "IQ2_XS/*" --local-dir ./data
+
+  # IQ3_XXS (~77 GB total)
+  hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF \
+    --include "IQ3_XXS/*" --local-dir ./data
   ```
 
 Check the driver is present:
@@ -62,13 +70,13 @@ ls /dev/kfd /dev/dri
 Pick the quant you want, `cd` into its folder, and bring it up:
 
 ```bash
-cd qwen_Q2_0          # or qwen_IQ2_XS
+cd qwen_Q2_0          # or qwen_IQ2_XS / qwen_IQ3_XXS
 docker compose up -d
 docker logs -f strata # or docker logs -f strata-qwen-IQ2_XS
 ```
 
-- Q2_0 serves at `http://localhost:8088` (OpenAI-compatible API at `/v1`).
-- IQ2_XS serves at `http://localhost:8089` so both can run side by side.
+- All three setups serve at `http://localhost:8088` (OpenAI-compatible API at `/v1`) —
+  bring up one at a time, or give each its own host port in `ports:`.
 
 The first run takes longer because it builds the pack and downloads the MTP layer.
 
@@ -114,6 +122,7 @@ in `docker-compose.yml` (or a `.env` file), or with `-e ...` on `docker run`.
 | `STRATA_DATA` | `/data` | Where the pack / MTP / config are written |
 | `API_KEY` | *(unset)* | Protect the API; clients send it as their API key |
 | `REINSTALL` | *(unset)* | Set to `1` to redo setup with new settings |
+| `MAX_TOKENS` | `22000` | Default `max_tokens` written to the shared-settings file (model folders that mount `entrypoint.sh`) |
 
 ### Build-time options
 
@@ -161,6 +170,31 @@ with `REINSTALL=1` so the pack and config are rebuilt:
 ```bash
 docker run -d --name strata -e REINSTALL=1 -e CONTEXT=8192 ... strata-rocm:7.2.4
 ```
+
+---
+
+## Max tokens (coding CLIs)
+
+`qwen_IQ2_XS/` and `qwen_IQ3_XXS/` mount an extra `entrypoint.sh` in front of
+`docker-entrypoint.sh`. Before the server starts it:
+
+- pins `"fit_max_tokens": true` in `strata-<model>.json`, so a request whose
+  `max_tokens` runs past the context is shortened to the room left instead of
+  answering `400`;
+- writes `{"max_tokens": MAX_TOKENS}` to `strata-<model>.shared-settings.json` — the
+  sidecar `serve/server.py` reads for requests that send no `max_tokens` — in both
+  `/data/config` and beside the `/opt/strata` config the server is started with.
+
+Check what the server picked up:
+
+```bash
+curl -s localhost:8088/settings    # {"shared": true, "defaults": {"max_tokens": 22000}}
+```
+
+A request that sends its **own** `max_tokens` is not capped — the server only clamps it
+to the space left in the context. For a hard 22000 limit, set it client-side
+(`maxTokens: 22000` in opencode, `max_tokens` in the request body). Note that
+`sampling.max_tokens` is not a Strata config key and is ignored.
 
 ---
 
