@@ -11,3 +11,6 @@ build-hip/
 # HF download staging and runtime logs
 .cache/
 *.log
+
+# Local backups
+*.bak
